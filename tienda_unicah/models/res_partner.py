@@ -1,38 +1,113 @@
 from odoo import api, fields, models
-from odoo.exceptions import ValidationError
+from odoo.exceptions import UserError
 
-TIPOS_CLIENTE = [
-    ("estudiante", "Estudiante"),
-    ("docente", "Docente"),
-    ("administrativo", "Administrativo"),
-    ("externo", "Externo"),
-]
+LIMITE_UNIDADES_ESTUDIANTE = 10
 
 
-class ResPartner(models.Model):
-    _inherit = "res.partner"
+class SaleOrder(models.Model):
+    _inherit = "sale.order"
 
     tipo_cliente = fields.Selection(
-        TIPOS_CLIENTE,
-        string="Tipo de cliente",
-        default="externo",
+        related="partner_id.tipo_cliente",
+        string="Tipo de cliente"
     )
 
-    numero_cuenta = fields.Char(
-        string="Número de cuenta",
+    convenio_id = fields.Many2one(
+        "tienda.convenio",
+        string="Convenio",
+        compute="_compute_convenio_id",
+        store=True,
+        readonly=False,
+        domain="[('tipo_cliente', '=', tipo_cliente)]",
+    )
+
+    convenio_aplicado = fields.Boolean(
+        string="Convenio aplicado",
+        readonly=True,
         copy=False
     )
 
-    carrera = fields.Char(string="Carrera")
+    monto_ahorro = fields.Monetary(
+        string="Ahorro por convenio",
+        compute="_compute_monto_ahorro",
+        store=True,
+        currency_field="currency_id",
+    )
 
-    @api.constrains("tipo_cliente", "numero_cuenta")
-    def _check_numero_cuenta(self):
-        for partner in self:
-            if partner.tipo_cliente == "estudiante":
-                numero = partner.numero_cuenta or ""
+    @api.depends("partner_id", "date_order")
+    def _compute_convenio_id(self):
+        for order in self:
+            fecha = (order.date_order or fields.Datetime.now()).date()
 
-                if len(numero) != 10 or not numero.isdigit():
-                    raise ValidationError(
-                        "El número de cuenta del estudiante debe "
-                        "tener exactamente 10 dígitos numéricos."
+            order.convenio_id = self.env["tienda.convenio"].search([
+                ("tipo_cliente", "=", order.partner_id.tipo_cliente),
+                ("fecha_inicio", "<=", fecha),
+                "|",
+                ("fecha_fin", "=", False),
+                ("fecha_fin", ">=", fecha),
+            ], limit=1)
+
+    def action_aplicar_convenio(self):
+        for order in self:
+            if order.state not in ("draft", "sent"):
+                raise UserError(
+                    "Solo se puede aplicar un convenio a una cotización."
+                )
+
+            if not order.convenio_id:
+                raise UserError(
+                    "El pedido no tiene un convenio asignado."
+                )
+
+            lineas = order.order_line.filtered(
+                lambda line: not line.display_type
+            )
+
+            lineas.write({
+                "discount": order.convenio_id.porcentaje
+            })
+
+            order.convenio_aplicado = True
+
+            order.message_post(
+                body=f"Se aplicó el {order.convenio_id.name} "
+                     f"con {order.convenio_id.porcentaje:g} % de descuento."
+            )
+
+    def action_confirm(self):
+        for order in self:
+            if order.tipo_cliente == "estudiante":
+                lineas = order.order_line.filtered(
+                    lambda line: not line.display_type
+                )
+
+                total_unidades = sum(
+                    lineas.mapped("product_uom_qty")
+                )
+
+                if total_unidades > LIMITE_UNIDADES_ESTUDIANTE:
+                    raise UserError(
+                        f"Los estudiantes pueden comprar máximo "
+                        f"{LIMITE_UNIDADES_ESTUDIANTE} unidades. "
+                        f"Este pedido contiene {total_unidades:g} unidades."
                     )
+
+        return super().action_confirm()
+
+    @api.depends(
+        "order_line.price_unit",
+        "order_line.product_uom_qty",
+        "order_line.discount",
+        "order_line.display_type",
+    )
+    def _compute_monto_ahorro(self):
+        for order in self:
+            lineas = order.order_line.filtered(
+                lambda line: not line.display_type
+            )
+
+            order.monto_ahorro = sum(
+                line.price_unit * line.product_uom_qty *
+                line.discount / 100
+                for line in lineas
+            )
