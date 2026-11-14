@@ -2,6 +2,7 @@ from odoo import fields, models
 
 from .res_partner import TIPOS_CLIENTE
 
+
 class TiendaConvenio(models.Model):
     _name = "tienda.convenio"
     _description = "Convenio de descuento"
